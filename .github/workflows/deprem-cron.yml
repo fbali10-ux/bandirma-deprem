@@ -1,0 +1,27 @@
+name: Bandirma Deprem Cron
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # her 15 dakikada bir
+  workflow_dispatch:        # manuel çalıştırma butonu
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repo'yu çek
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Kütüphaneleri kur
+        run: |
+          pip install -r requirements.txt
+
+      - name: Deprem scriptini çalıştır
+        run: |
+          python main.py
