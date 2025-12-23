@@ -1,0 +1,45 @@
+name: Deprem DB Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # 15 dakikada bir
+
+permissions:
+  contents: write   # commit/push için şart
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo'yu cek
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Kutuphaneleri kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Deprem scriptini calistir
+        run: |
+          python main.py
+
+      - name: DB degisti mi? commit+push
+        run: |
+          git status --porcelain
+          git add deprem.db
+          if git diff --cached --quiet; then
+            echo "DB degismemis, push yok."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "deprem.db guncellendi"
+          git push
