@@ -1,4 +1,7 @@
 name: Deprem DB Sync
+permissions:
+  contents: write
+
 
 on:
   workflow_dispatch:
@@ -35,23 +38,25 @@ jobs:
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "text=✅ GitHub Actions test mesajı (Deprem DB Sync) çalıştı."
-
-
-
-          
+        
 
       - name: Deprem scriptini calistir
         run: |
           python main.py
 
       - name: DB degisti mi? commit+push
-        run: |
-          git status --porcelain
-          git add deprem.db
-          if git diff --cached --quiet; then
+  	run: |
+    	  git config user.name "github-actions[bot]"
+    	  git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    	  if git status --porcelain | grep .; then
+      	    git add deprem.db
+      	    git commit -m "deprem.db guncellendi"
+      	    git push
+    	  else
             echo "DB degismemis, push yok."
-            exit 0
-          fi
+    	 fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -m "deprem.db guncellendi"
