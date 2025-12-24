@@ -45,7 +45,7 @@ jobs:
           python main.py
 
       - name: DB degisti mi? commit+push
-  	run: |
+  	    run: |
     	  git config user.name "github-actions[bot]"
     	  git config user.email "github-actions[bot]@users.noreply.github.com"
 
