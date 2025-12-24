@@ -164,3 +164,11 @@ def test_telegram():
 
 test_telegram()
 # === TEST SONU ===
+# --- TELEGRAM TEST MESAJI (KOSULSUZ) ---
+try:
+    test_msg = "✅ Telegram test mesajı: sistem çalışıyor"
+    send_telegram_message(test_msg)
+    print("Telegram test mesajı gönderildi")
+except Exception as e:
+    print("Telegram test hatası:", e)
+
