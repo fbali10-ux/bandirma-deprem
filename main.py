@@ -7,8 +7,8 @@ from bs4 import BeautifulSoup
 # ===============================
 # ENV (GitHub Actions Secrets)
 # ===============================
-BOT_TOKEN = os.getenv("8469619745:AAFv3Gbl5AFBvsHthRwfI8IrY24zOCv-Pyo")
-CHAT_ID = os.getenv("-1003402835744")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 DB_FILE = "deprem.db"
 KOERI_URL = "http://www.koeri.boun.edu.tr/scripts/lst9.asp"
@@ -151,8 +151,8 @@ if __name__ == "__main__":
 def test_telegram():
     import requests, os
 
-    token = os.environ.get("8469619745:AAFv3Gbl5AFBvsHthRwfI8IrY24zOCv-Pyo")
-    chat_id = os.environ.get("-1003402835744")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     r = requests.post(url, data={
