@@ -9,6 +9,32 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 import re
+import os
+import requests
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secret'ları eksik")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        r.raise_for_status()
+        print("Telegram mesajı gönderildi")
+    except Exception as e:
+        print("Telegram hata:", e)
+
 from typing import List, Dict, Tuple, Optional
 
 KOERI_URL = "http://www.koeri.boun.edu.tr/scripts/lst9.asp"
@@ -440,3 +466,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+if __name__ == "__main__":
+    send_telegram_message("✅ Bandırma Deprem Alarm botu çalışıyor.")
