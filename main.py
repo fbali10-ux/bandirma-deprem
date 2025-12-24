@@ -147,3 +147,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+# === TELEGRAM TEST ===
+def test_telegram():
+    import requests, os
+
+    token = os.environ.get("8469619745:AAFv3Gbl5AFBvsHthRwfI8IrY24zOCv-Pyo")
+    chat_id = os.environ.get("-1003402835744")
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = requests.post(url, data={
+        "chat_id": chat_id,
+        "text": "✅ Bandırma Deprem Alarm BOT test mesajı"
+    })
+
+    print("Telegram test sonucu:", r.text)
+
+test_telegram()
+# === TEST SONU ===
