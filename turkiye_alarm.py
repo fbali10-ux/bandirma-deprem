@@ -1,58 +1,99 @@
+# turkiye_alarm.py
+# -*- coding: utf-8 -*-
+
 import os
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from math import radians, sin, cos, sqrt, atan2
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+# ------------------------------------------------------------
+# Datetime helpers (CRITICAL: naive vs aware problemini çözer)
+# ------------------------------------------------------------
+def parse_event_time_to_utc_naive(s: str) -> datetime:
+    """
+    DB'deki event_time genelde şu formatlarda gelir:
+      - 2025-12-25T08:38:32Z
+      - 2025-12-25T08:38:32+00:00
+      - 2025-12-25 08:38:32   (nadiren)
+    Biz hepsini UTC'ye çevirip tz'siz (naive) datetime döndürüyoruz.
+    Böylece naive/aware karşılaştırma hatası biter.
+    """
+    if not s:
+        return datetime(1970, 1, 1)
+
+    s = s.strip()
+
+    try:
+        # ISO: "Z" -> "+00:00"
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            # fromisoformat hem "T" hem " " ayırıcıyı kabul eder
+            dt = datetime.fromisoformat(s)
+    except Exception:
+        # son çare: "YYYY-MM-DD HH:MM:SS"
+        try:
+            dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime(1970, 1, 1)
+
+    # dt aware ise UTC'ye çevirip tzinfo kaldır (naive UTC)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # dt zaten naive ise "UTC naive" kabul ediyoruz
+    return dt
 
 
-def iso(dt: datetime) -> str:
-    # SQLite'da TEXT isoformat saklıyoruz
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+def utc_now_naive() -> datetime:
+    """UTC now (naive) - deprecated utcnow kullanmadan."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# ------------------------------------------------------------
+# Geo helpers
+# ------------------------------------------------------------
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         (math.sin(dlon / 2) ** 2))
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 
 def within_radius(rows, center_lat: float, center_lon: float, radius_km: float):
+    """
+    rows: list[dict] beklenir: {"dt","lat","lon","depth","mag","loc"}
+    """
     out = []
     for r in rows:
-        d = haversine_km(center_lat, center_lon, r["latitude"], r["longitude"])
+        d = haversine_km(center_lat, center_lon, r["lat"], r["lon"])
         if d <= radius_km:
             out.append(r)
     return out
 
 
-def _parse_iso(dt_str: str) -> datetime:
-    # event_time isoformat (UTC) bekliyoruz
-    # örn: 2025-12-25T08:38:32+00:00
-    try:
-        return datetime.fromisoformat(dt_str)
-    except Exception:
-        # fallback: Z yoksa
-        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-
-
-# -----------------------------
-# DB fetch (LAT/LON değil: latitude/longitude)
-# -----------------------------
+# ------------------------------------------------------------
+# DB
+# ------------------------------------------------------------
 def fetch_rows(db_file: str, since_dt: datetime):
-    since_iso = iso(since_dt)
+    """
+    DB kolonları (senin ekranda gördüğün):
+    ['event_id','event_time','latitude','longitude','depth','magnitude','location','source']
+
+    since_dt: naive UTC datetime
+    """
+    since_iso = since_dt.replace(microsecond=0).isoformat(timespec="seconds") + "Z"
+
     con = sqlite3.connect(db_file)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
 
+    # event_time ISO string olduğu için string compare çalışıyor (Z ile sabit format)
     cur.execute(
         """
         SELECT event_time, latitude, longitude, depth, magnitude, location
@@ -60,226 +101,198 @@ def fetch_rows(db_file: str, since_dt: datetime):
         WHERE event_time >= ?
         ORDER BY event_time DESC
         """,
-        (since_iso,),
+        (since_iso,)
     )
+
     rows = []
     for row in cur.fetchall():
-        rows.append(
-            {
-                "event_time": row["event_time"],
-                "dt": _parse_iso(row["event_time"]),
-                "latitude": float(row["latitude"]),
-                "longitude": float(row["longitude"]),
-                "depth": float(row["depth"]) if row["depth"] is not None else None,
-                "magnitude": float(row["magnitude"]) if row["magnitude"] is not None else None,
-                "location": row["location"] or "",
-            }
-        )
+        dt = parse_event_time_to_utc_naive(row["event_time"])
+        rows.append({
+            "dt": dt,
+            "lat": float(row["latitude"]),
+            "lon": float(row["longitude"]),
+            "depth": float(row["depth"]) if row["depth"] is not None else None,
+            "mag": float(row["magnitude"]) if row["magnitude"] is not None else None,
+            "loc": (row["location"] or "").strip(),
+        })
+
     con.close()
     return rows
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Alarm logic
-# -----------------------------
-def _count_ge(rows, mag: float) -> int:
-    return sum(1 for r in rows if (r["magnitude"] is not None and r["magnitude"] >= mag))
+# ------------------------------------------------------------
+def count_ge(rows, mag_threshold: float) -> int:
+    return sum(1 for r in rows if (r["mag"] is not None and r["mag"] >= mag_threshold))
 
 
-def _max_mag(rows) -> float:
-    mags = [r["magnitude"] for r in rows if r["magnitude"] is not None]
+def max_mag(rows) -> float:
+    mags = [r["mag"] for r in rows if r["mag"] is not None]
     return max(mags) if mags else 0.0
 
 
-def evaluate_cluster_criteria(rows_24h, rows_7d, rows_30d):
+def format_top(rows, n=5) -> str:
+    out = []
+    for r in rows[:n]:
+        out.append(f"- {r['dt'].strftime('%Y-%m-%d %H:%M:%S')} | M{r['mag']:.1f} | {r['loc']}")
+    return "\n".join(out) if out else "- (yok)"
+
+
+def bandirma_alarm(rows_24h, rows_7d, rows_30d):
     """
-    Kullanıcının verdiği kriterler (yarıçap dışarıdan seçilecek):
+    Bandırma (yarıçap main.py’den gelir; sen 70 km istedin)
     🟠 Turuncu:
-      - 24h: M>=3.0 >=40 AND maxMag>=4.0
-      - 7d:  M>=3.0 >=25 AND M>=4.0 >=2
+      - 24h: M>=3.0 >=40 ve maxMag(24h) >=4.0
+      - 7d:  M>=3.0 >=25 ve M>=4.0 >=2
       - 30d: M>=5.0 >=1
     🔴 Kırmızı:
       - 7d:  M>=6.5 >=1
       - 30d: M>=5.8 >=2
       - 24h: M>=4.0 >=10
     """
-    c24_m3 = _count_ge(rows_24h, 3.0)
-    c24_m4 = _count_ge(rows_24h, 4.0)
-    max24 = _max_mag(rows_24h)
+    c24_m3 = count_ge(rows_24h, 3.0)
+    c24_m4 = count_ge(rows_24h, 4.0)
+    mx24 = max_mag(rows_24h)
 
-    c7_m3 = _count_ge(rows_7d, 3.0)
-    c7_m4 = _count_ge(rows_7d, 4.0)
-    c7_m65 = _count_ge(rows_7d, 6.5)
+    c7_m3 = count_ge(rows_7d, 3.0)
+    c7_m4 = count_ge(rows_7d, 4.0)
+    c7_m65 = count_ge(rows_7d, 6.5)
 
-    c30_m5 = _count_ge(rows_30d, 5.0)
-    c30_m58 = _count_ge(rows_30d, 5.8)
+    c30_m5 = count_ge(rows_30d, 5.0)
+    c30_m58 = count_ge(rows_30d, 5.8)
 
-    # KIRMIZI
-    red = (c7_m65 >= 1) or (c30_m58 >= 2) or (c24_m4 >= 10)
+    orange = (
+        (c24_m3 >= 40 and mx24 >= 4.0) or
+        (c7_m3 >= 25 and c7_m4 >= 2) or
+        (c30_m5 >= 1)
+    )
 
-    # TURUNCU
-    orange = ((c24_m3 >= 40) and (max24 >= 4.0)) or ((c7_m3 >= 25) and (c7_m4 >= 2)) or (c30_m5 >= 1)
+    red = (
+        (c7_m65 >= 1) or
+        (c30_m58 >= 2) or
+        (c24_m4 >= 10)
+    )
 
-    detail = {
-        "c24_m3": c24_m3,
-        "c24_m4": c24_m4,
-        "max24": max24,
-        "c7_m3": c7_m3,
-        "c7_m4": c7_m4,
-        "c7_m65": c7_m65,
-        "c30_m5": c30_m5,
-        "c30_m58": c30_m58,
-    }
-    return red, orange, detail
+    lines = []
+    lines.append(f"24s: M>=3.0={c24_m3}, M>=4.0={c24_m4}, maxM24={mx24:.1f}")
+    lines.append(f"7g : M>=3.0={c7_m3}, M>=4.0={c7_m4}, M>=6.5={c7_m65}")
+    lines.append(f"30g: M>=5.0={c30_m5}, M>=5.8={c30_m58}")
+
+    return orange, red, "\n".join(lines)
 
 
-def find_best_cluster(all_rows_30d, radius_km: float, candidate_days: int = 7):
+def find_best_cluster(all_rows_30d, radius_km: float, candidate_days: int):
     """
-    Türkiye geneli: "küme"yi aramak için
-    son candidate_days içindeki olayları merkez adayı yapıp (lat/lon),
-    o merkezin çevresinde 24h/7d/30d kriterlerini kontrol eder.
+    Türkiye geneli "küme" yaklaşımı:
+    - Son 30 günden aday merkezler seç (en büyük magnitüdlü ilk N olay)
+    - Her aday için son candidate_days içinde yarıçapta maxM hesapla
+    - En yüksek maxM olan merkezi döndür
     """
-    now = utc_now()
-    since_24h = now - timedelta(hours=24)
-    since_7d = now - timedelta(days=7)
-    since_30d = now - timedelta(days=30)
-    since_candidates = now - timedelta(days=candidate_days)
-
-    rows_candidates = [r for r in all_rows_30d if r["dt"] >= since_candidates]
-    if not rows_candidates:
+    if not all_rows_30d:
         return None
 
-    # performans: sadece daha anlamlı adayları alalım (M>=3 veya son 7 gün)
-    # çok büyük DB'lerde çarpan azaltır
-    rows_candidates = [r for r in rows_candidates if (r["magnitude"] is not None and r["magnitude"] >= 3.0)] or rows_candidates
+    now = utc_now_naive()
+    since_candidates = now - timedelta(days=candidate_days)
 
-    best = None  # dict
-    # en fazla 250 adayla sınırlayalım (yeter)
-    for cand in rows_candidates[:250]:
-        clat, clon = cand["latitude"], cand["longitude"]
+    # CRITICAL: dt hepsi naive UTC olduğu için karşılaştırma güvenli
+    recent = [r for r in all_rows_30d if r["dt"] >= since_candidates]
+    if not recent:
+        recent = all_rows_30d
 
-        rows_24h = [r for r in all_rows_30d if r["dt"] >= since_24h]
-        rows_7d = [r for r in all_rows_30d if r["dt"] >= since_7d]
-        rows_30d = [r for r in all_rows_30d if r["dt"] >= since_30d]
+    # en büyük M olanlardan aday merkezler
+    candidates = sorted(recent, key=lambda r: (r["mag"] or 0.0), reverse=True)[:25]
 
-        w24 = within_radius(rows_24h, clat, clon, radius_km)
-        w7 = within_radius(rows_7d, clat, clon, radius_km)
-        w30 = within_radius(rows_30d, clat, clon, radius_km)
+    best = None
+    best_mx = -1.0
+    best_rows = None
 
-        red, orange, detail = evaluate_cluster_criteria(w24, w7, w30)
-        if not (red or orange):
-            continue
+    for c in candidates:
+        clat, clon = c["lat"], c["lon"]
+        in_rad = within_radius(all_rows_30d, clat, clon, radius_km)
+        mx = max_mag(in_rad)
+        if mx > best_mx:
+            best_mx = mx
+            best = (clat, clon)
+            best_rows = sorted(in_rad, key=lambda r: r["dt"], reverse=True)
 
-        sev = 2 if red else 1
-        score = sev * 1_000_000 + int(detail["c24_m3"]) * 1000 + int(detail["c7_m3"])  # basit skor
-
-        if (best is None) or (score > best["score"]):
-            best = {
-                "score": score,
-                "severity": "RED" if red else "ORANGE",
-                "center_lat": clat,
-                "center_lon": clon,
-                "detail": detail,
-                "sample_location": cand["location"],
-                "top_events_24h": sorted(w24, key=lambda x: (x["magnitude"] or 0), reverse=True)[:5],
-            }
-
-    return best
-
-
-def bandirma_magnitude_alarm(all_rows_30d, center_lat, center_lon, radius_km: float):
-    """
-    Bandırma yerel ikinci kriter:
-    🟠 TURUNCU: 30 gün, Mw>=5.0 (hedef) => 70 km içinde >=1
-    🔴 KIRMIZI: 7–14 gün, Mw>=5.5 => 70 km içinde >=1 (burada 14 gün aldık)
-    """
-    now = utc_now()
-    rows_14d = [r for r in all_rows_30d if r["dt"] >= (now - timedelta(days=14))]
-    rows_30d = [r for r in all_rows_30d if r["dt"] >= (now - timedelta(days=30))]
-
-    w14 = within_radius(rows_14d, center_lat, center_lon, radius_km)
-    w30 = within_radius(rows_30d, center_lat, center_lon, radius_km)
-
-    red = _count_ge(w14, 5.5) >= 1
-    orange = _count_ge(w30, 5.0) >= 1
-
-    detail = {
-        "w14_m55": _count_ge(w14, 5.5),
-        "w30_m50": _count_ge(w30, 5.0),
-        "max14": _max_mag(w14),
-        "max30": _max_mag(w30),
+    return {
+        "center": best,
+        "maxM_30d": best_mx,
+        "rows_30d": best_rows or []
     }
 
-    top = sorted(w30, key=lambda x: (x["magnitude"] or 0), reverse=True)[:5]
-    return red, orange, detail, top
+
+def turkey_alarm_cluster(all_rows_30d, radius_km: float):
+    """
+    Türkiye geneli küme alarmı (yarıçap 70):
+    🟠 TURUNCU: hedef Mw>=5.0, pencere 30 gün
+    🔴 KIRMIZI: hedef Mw>=5.5, pencere 7–14 gün (biz 14 gün alıyoruz)
+    """
+    if not all_rows_30d:
+        return False, False, "TR küme: veri yok"
+
+    cluster = find_best_cluster(all_rows_30d, radius_km=radius_km, candidate_days=14)
+    if not cluster or not cluster["center"]:
+        return False, False, "TR küme: merkez bulunamadı"
+
+    clat, clon = cluster["center"]
+    rows30 = cluster["rows_30d"]
+    mx30 = max_mag(rows30)
+
+    now = utc_now_naive()
+    rows14 = [r for r in rows30 if r["dt"] >= (now - timedelta(days=14))]
+    mx14 = max_mag(rows14)
+
+    orange = (mx30 >= 5.0)
+    red = (mx14 >= 5.5)
+
+    msg = []
+    msg.append(f"Merkez: {clat:.4f}, {clon:.4f} | Yarıçap: {radius_km:.0f} km")
+    msg.append(f"maxM(30g)={mx30:.1f} | maxM(14g)={mx14:.1f}")
+    msg.append("Son olaylar:")
+    msg.append(format_top(sorted(rows30, key=lambda r: r['dt'], reverse=True), n=5))
+    return orange, red, "\n".join(msg)
 
 
 def build_report(db_file: str, bandirma_lat: float, bandirma_lon: float, radius_km: float = 70.0):
-    now = utc_now()
-    rows_30d = fetch_rows(db_file, now - timedelta(days=30))
+    """
+    main.py burayı çağırıyor:
+      has_alarm, msg = build_report(DB_FILE, BANDIRMA_LAT, BANDIRMA_LON, radius_km=70.0)
+    """
+    now = utc_now_naive()
 
-    # 1) Türkiye geneli küme alarmı (kriter set 1)
-    best_cluster = find_best_cluster(rows_30d, radius_km=radius_km, candidate_days=7)
+    all_30d = fetch_rows(db_file, now - timedelta(days=30))
+    all_7d = fetch_rows(db_file, now - timedelta(days=7))
+    all_24h = fetch_rows(db_file, now - timedelta(hours=24))
 
-    # 2) Bandırma 70 km yerel alarm (kriter set 2)
-    b_red, b_orange, b_detail, b_top = bandirma_magnitude_alarm(
-        rows_30d, bandirma_lat, bandirma_lon, radius_km=radius_km
-    )
+    # Bandırma çevresi
+    b_30d = within_radius(all_30d, bandirma_lat, bandirma_lon, radius_km)
+    b_7d = within_radius(all_7d, bandirma_lat, bandirma_lon, radius_km)
+    b_24h = within_radius(all_24h, bandirma_lat, bandirma_lon, radius_km)
 
-    has_alarm = False
-    lines = []
-    lines.append("🛰️ <b>Deprem Alarm Özeti</b>")
-    lines.append(f"🕒 UTC: {iso(now)}")
-    lines.append("")
+    b_orange, b_red, b_stats = bandirma_alarm(b_24h, b_7d, b_30d)
 
-    # --- Türkiye Cluster
-    lines.append("🇹🇷 <b>Türkiye Geneli Küme Alarmı</b>")
-    lines.append(f"📏 Yarıçap: {radius_km:.0f} km (küme arama)")
-    if best_cluster is None:
-        lines.append("✅ Kriterleri sağlayan küme yok.")
-    else:
-        sev = best_cluster["severity"]
-        has_alarm = True
-        emoji = "🔴" if sev == "RED" else "🟠"
-        d = best_cluster["detail"]
-        lines.append(f"{emoji} <b>{'KIRMIZI' if sev=='RED' else 'TURUNCU'}</b> (küme tespit)")
-        lines.append(f"🎯 Merkez: {best_cluster['center_lat']:.4f}, {best_cluster['center_lon']:.4f}")
-        if best_cluster.get("sample_location"):
-            lines.append(f"📍 Örnek yer: {best_cluster['sample_location']}")
-        lines.append(
-            f"24h: M≥3.0={d['c24_m3']} | M≥4.0={d['c24_m4']} | maxMag={d['max24']:.1f}"
-        )
-        lines.append(
-            f"7d:  M≥3.0={d['c7_m3']} | M≥4.0={d['c7_m4']} | M≥6.5={d['c7_m65']}"
-        )
-        lines.append(
-            f"30d: M≥5.0={d['c30_m5']} | M≥5.8={d['c30_m58']}"
-        )
-        if best_cluster["top_events_24h"]:
-            lines.append("Son 24h (en büyük 5):")
-            for e in best_cluster["top_events_24h"]:
-                lines.append(f" • Mw {e['magnitude']:.1f} | {e['event_time']} | {e['location']}")
-    lines.append("")
+    # Türkiye geneli küme (aynı yarıçapı kullan)
+    tr_orange, tr_red, tr_info = turkey_alarm_cluster(all_30d, radius_km=radius_km)
 
-    # --- Bandırma Local
-    lines.append("📍 <b>Bandırma 70 km Yerel Alarm</b>")
-    lines.append(f"🎯 Merkez: {bandirma_lat:.4f}, {bandirma_lon:.4f} | 📏 {radius_km:.0f} km")
-    # Kırmızı öncelik
-    if b_red:
-        has_alarm = True
-        lines.append("🔴 <b>KIRMIZI</b> (14g içinde Mw≥5.5 tespit)")
-    elif b_orange:
-        has_alarm = True
-        lines.append("🟠 <b>TURUNCU</b> (30g içinde Mw≥5.0 tespit)")
-    else:
-        lines.append("✅ Kriter yok.")
-    lines.append(f"14g: Mw≥5.5 = {b_detail['w14_m55']} | max={b_detail['max14']:.1f}")
-    lines.append(f"30g: Mw≥5.0 = {b_detail['w30_m50']} | max={b_detail['max30']:.1f}")
+    # Telegram mesajı
+    msg = []
+    msg.append("📌 **BANDIRMA (70 km) ALARM**")
+    msg.append(("🔴 KIRMIZI" if b_red else ("🟠 TURUNCU" if b_orange else "🟢 NORMAL")))
+    msg.append(b_stats)
+    msg.append("Son Bandırma olayları:")
+    msg.append(format_top(sorted(b_30d, key=lambda r: r["dt"], reverse=True), n=5))
 
-    if b_top:
-        lines.append("Son 30g (en büyük 5):")
-        for e in b_top:
-            lines.append(f" • Mw {e['magnitude']:.1f} | {e['event_time']} | {e['location']}")
+    msg.append("\n📌 **TÜRKİYE GENELİ KÜME (70 km) ALARM**")
+    msg.append(("🔴 KIRMIZI" if tr_red else ("🟠 TURUNCU" if tr_orange else "🟢 NORMAL")))
+    msg.append(tr_info)
 
-    msg = "\n".join(lines)
-    return has_alarm, msg
+    has_alarm = (b_orange or b_red or tr_orange or tr_red)
+    return has_alarm, "\n".join(msg)
+
+
+# main.py importları bozulmasın diye:
+def turkey_alarm(*args, **kwargs):
+    # geriye uyum için alias
+    return turkey_alarm_cluster(*args, **kwargs)
