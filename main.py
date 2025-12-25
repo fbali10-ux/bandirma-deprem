@@ -1,9 +1,10 @@
 import os
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
-import hashlib
+
+from turkiye_alarm import evaluate_turkiye_clusters, evaluate_bandirma_alarm
 
 # ===============================
 # ENV (GitHub Actions Secrets)
@@ -12,45 +13,33 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 DB_FILE = "deprem.db"
-# KOERI: Son 500 deprem listesi (pre içinde)
-KOERI_URL = "http://www.koeri.boun.edu.tr/scripts/lst6.asp"
+KOERI_URL = "http://www.koeri.boun.edu.tr/scripts/lst9.asp"
+
+# Bandırma merkez (ENV ile override edilebilir)
+BANDIRMA_LAT = float(os.getenv("BANDIRMA_LAT", "40.3529"))
+BANDIRMA_LON = float(os.getenv("BANDIRMA_LON", "27.9767"))
+BANDIRMA_RADIUS_KM = float(os.getenv("BANDIRMA_RADIUS_KM", "70"))
+
+# Türkiye küme yarıçapı
+TR_CLUSTER_RADIUS_KM = float(os.getenv("TR_CLUSTER_RADIUS_KM", "70"))
 
 # ===============================
 # Telegram
 # ===============================
 def telegram_send(message: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram env eksik (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
+        print("Telegram env eksik (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=payload, timeout=20)
-    except Exception as e:
-        print("Telegram gönderim hatası:", e)
-
-# ===============================
-# Helpers
-# ===============================
-def iso_from_koeri(date_str: str, time_str: str) -> str:
-    # KOERI format: YYYY.MM.DD HH:MM:SS
-    dt = datetime.strptime(f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S")
-    return dt.strftime("%Y-%m-%dT%H:%M:%S")
-
-def make_event_id(event_time: str, lat: float, lon: float, mag: float) -> str:
-    s = f"{event_time}|{lat:.4f}|{lon:.4f}|{mag:.1f}"
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
-
-def pick_mag(md: str, ml: str, mw: str) -> float:
-    # KOERI sütunları bazen "--"
-    for v in (mw, ml, md):
-        if v and v != "--":
-            try:
-                return float(v)
-            except:
-                pass
-    return 0.0
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, data=payload, timeout=20)
+    print("Telegram:", r.status_code)
 
 # ===============================
 # Database
@@ -60,135 +49,219 @@ def init_db():
     cur = con.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS earthquakes (
-            event_id TEXT PRIMARY KEY,
-            event_time TEXT NOT NULL,
-            latitude REAL,
-            longitude REAL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_time TEXT,
+            lat REAL,
+            lon REAL,
             depth REAL,
             magnitude REAL,
             location TEXT,
-            source TEXT,
-            UNIQUE(event_time, latitude, longitude, magnitude)
+            source TEXT DEFAULT 'KOERI',
+            UNIQUE(event_time, lat, lon, magnitude)
         )
     """)
     con.commit()
     con.close()
 
-def insert_event(ev):
-    # ev: (event_id, event_time, lat, lon, depth, mag, location, source)
+def insert_event(row):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     try:
         cur.execute("""
             INSERT OR IGNORE INTO earthquakes
-            (event_id, event_time, latitude, longitude, depth, magnitude, location, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, ev)
+            (event_time, lat, lon, depth, magnitude, location, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, row)
         con.commit()
         inserted = cur.rowcount
     except Exception as e:
-        print("DB insert hata:", e)
+        print("DB hata:", e)
         inserted = 0
     con.close()
     return inserted
+
+def get_rows_last_days(days: int):
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds")
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT event_time, lat, lon, depth, magnitude, location
+        FROM earthquakes
+        WHERE event_time >= ?
+        ORDER BY event_time DESC
+    """, (since,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
 
 # ===============================
 # Fetch KOERI
 # ===============================
 def fetch_koeri():
-    r = requests.get(KOERI_URL, timeout=30)
-    r.encoding = "utf-8"  # KOERI türkçe karakterler için
-    soup = BeautifulSoup(r.text, "html.parser")
-
+    html = requests.get(KOERI_URL, timeout=30).content
+    soup = BeautifulSoup(html, "html.parser")
     pre = soup.find("pre")
     if not pre:
-        print("KOERI sayfasında <pre> bulunamadı.")
         return []
 
-    lines = pre.get_text("\n").splitlines()
+    lines = pre.get_text().splitlines()
     events = []
 
     for ln in lines:
         ln = ln.strip()
-        if not ln:
-            continue
-        # Başlık/ayırıcı satırları ele
-        if ln.startswith("Tarih") or "SON DEPREMLER" in ln or ln.startswith("----") or ln.startswith(".."):
+        if not ln or ln.startswith("Tarih") or ln.startswith("Date"):
             continue
 
         parts = ln.split()
-        # Beklenen minimum kolon: date time lat lon depth md ml mw yer ... çözüm
-        if len(parts) < 10:
+        if len(parts) < 8:
             continue
 
         try:
-            date_str = parts[0]          # 2025.12.25
-            time_str = parts[1]          # 08:38:32
+            date = parts[0]  # 2025.12.25
+            time = parts[1]  # 08:38:32
             lat = float(parts[2])
             lon = float(parts[3])
             depth = float(parts[4])
 
-            md = parts[5] if len(parts) > 5 else "--"
-            ml = parts[6] if len(parts) > 6 else "--"
-            mw = parts[7] if len(parts) > 7 else "--"
-            mag = pick_mag(md, ml, mw)
+            # büyüklük: güvenli tarama
+            mag = None
+            for tok in parts[5:12]:
+                try:
+                    v = float(tok)
+                    if 0.0 <= v <= 10.0:
+                        mag = v
+                        break
+                except:
+                    pass
+            if mag is None:
+                mag = float(parts[6])
 
-            # Son token genelde "İlksel" vb çözüm niteliği. Biz location içine katmıyoruz.
-            # Location = parts[8:-1]
-            location = " ".join(parts[8:-1]).strip()
-            if not location:
-                location = " ".join(parts[8:]).strip()
+            location = " ".join(parts[7:]).strip()
 
-            event_time = iso_from_koeri(date_str, time_str)  # "YYYY-MM-DDTHH:MM:SS"
-            event_id = make_event_id(event_time, lat, lon, mag)
+            event_time = datetime.strptime(f"{date} {time}", "%Y.%m.%d %H:%M:%S") \
+                                 .isoformat(timespec="seconds")
 
-            events.append((event_id, event_time, lat, lon, depth, mag, location, "KOERI"))
+            events.append((event_time, lat, lon, depth, mag, location, "KOERI"))
         except:
             continue
 
     return events
 
 # ===============================
-# Alarm Kontrol (şimdilik basit)
+# Mesaj formatları
 # ===============================
-def check_alarm(ev):
-    # ev: (event_id, event_time, lat, lon, depth, mag, location, source)
-    mag = ev[5]
-    return mag >= 4.5  # sonra turuncu/kırmızıya bağlarız
+def _fmt_event(e):
+    if not e:
+        return "-"
+    t = e["t"].strftime("%Y-%m-%d %H:%M:%S")
+    m = e["mag"]
+    loc = (e.get("location") or "").strip()
+    return f"{t} | Mw {m:.1f} | {loc}"
+
+def build_message(tr: dict, bd: dict) -> str:
+    now = tr["now_utc"].strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) Bandırma başlığı
+    bd_state = "🔴 <b>KIRMIZI</b>" if bd["red"] else ("🟠 <b>TURUNCU</b>" if bd["orange"] else "✅ <b>NORMAL</b>")
+    msg = (
+        f"🕒 UTC: {now}\n\n"
+        f"📍 <b>Bandırma 70 km Alarm</b> ({bd_state})\n"
+        f"Merkez: {BANDIRMA_LAT:.4f},{BANDIRMA_LON:.4f} | Yarıçap: {bd['radius_km']} km\n"
+    )
+
+    c = bd["counts"]
+    msg += (
+        f"• 24s: M≥3={c['24h_M>=3']} | M≥4={c['24h_M>=4']} | maxMw={c['24h_max'] if c['24h_max'] is not None else '-'}\n"
+        f"• 7g : M≥3={c['7d_M>=3']} | M≥4={c['7d_M>=4']} | M≥6.5={c['7d_M>=6.5']}\n"
+        f"• 30g: M≥5={c['30d_M>=5']} | M≥5.8={c['30d_M>=5.8']}\n"
+    )
+
+    if bd["red"]:
+        msg += "\n🔴 <b>Kırmızı neden(ler):</b>\n" + "\n".join([f"• {r}" for r in bd["red_reasons"]]) + "\n"
+    elif bd["orange"]:
+        msg += "\n🟠 <b>Turuncu neden(ler):</b>\n" + "\n".join([f"• {r}" for r in bd["orange_reasons"]]) + "\n"
+    else:
+        msg += "\n✅ Alarm yok.\n"
+
+    msg += (
+        f"\nEn büyük 24s: {_fmt_event(bd['top']['24h'])}\n"
+        f"En büyük 7g : {_fmt_event(bd['top']['7d'])}\n"
+        f"En büyük 30g: {_fmt_event(bd['top']['30d'])}\n"
+    )
+
+    # 2) Türkiye geneli başlığı
+    reds = tr["red"]
+    oranges = tr["orange"]
+    msg += (
+        f"\n\n🇹🇷 <b>Türkiye Geneli Küme Alarmı</b> (Küme yarıçapı: {tr['radius_km']} km)\n"
+        f"🔴 Kırmızı küme: <b>{len(reds)}</b> | 🟠 Turuncu küme: <b>{len(oranges)}</b>\n"
+        f"(Turuncu: 30g maxMw≥5.0 | Kırmızı: 14g maxMw≥5.5)\n"
+    )
+
+    # kırmızı top 3
+    if reds:
+        msg += "\n🔴 <b>KIRMIZI (Top 3)</b>\n"
+        for i, cl in enumerate(reds[:3], 1):
+            top = cl["red_top"] or cl["orange_top"]
+            msg += f"{i}) {_fmt_event(top)} | (kayıt: {cl['count_redwin']})\n"
+    else:
+        msg += "\n🔴 Kırmızı küme yok.\n"
+
+    # turuncu top 3
+    if oranges:
+        msg += "\n🟠 <b>TURUNCU (Top 3)</b>\n"
+        for i, cl in enumerate(oranges[:3], 1):
+            top = cl["orange_top"]
+            msg += f"{i}) {_fmt_event(top)} | (kayıt: {cl['count_30d']})\n"
+    else:
+        msg += "\n🟠 Turuncu küme yok.\n"
+
+    return msg
 
 # ===============================
 # MAIN
 # ===============================
 def main():
     init_db()
-    events = fetch_koeri()
 
-    if not events:
-        print("KOERI'den veri gelmedi.")
-        return
+    # 1) KOERI -> DB sync
+    inserted_total = 0
+    try:
+        events = fetch_koeri()
+        for ev in events:
+            inserted_total += insert_event(ev)
+        print("KOERI satır:", len(events), "Yeni eklenen:", inserted_total)
+    except Exception as e:
+        print("KOERI fetch hata:", e)
 
-    new_events = []
-    for ev in events:
-        if insert_event(ev):
-            new_events.append(ev)
+    # 2) Analizler DB üzerinden (bandırma 30 gün + tr 30 gün yeterli)
+    rows_30d = get_rows_last_days(30)
 
-    print(f"KOERI parse: {len(events)} satır, DB'ye yeni eklenen: {len(new_events)}")
+    now = datetime.utcnow()
 
-    # Alarm varsa Telegram
-    alarm_events = [e for e in new_events if check_alarm(e)]
-    if alarm_events:
-        msg = "🚨 <b>DEPREM ALARM</b>\n\n"
-        for e in alarm_events:
-            _, t, lat, lon, d, m, loc, src = e
-            msg += (
-                f"📍 {loc}\n"
-                f"🕒 {t}\n"
-                f"🌍 {lat},{lon}\n"
-                f"📏 Derinlik: {d} km\n"
-                f"📊 M: <b>{m}</b>\n"
-                f"🔎 Kaynak: {src}\n\n"
-            )
-        telegram_send(msg)
+    # Bandırma (70 km) - senin kriterlerin
+    bd = evaluate_bandirma_alarm(
+        db_rows=rows_30d,
+        center_lat=BANDIRMA_LAT,
+        center_lon=BANDIRMA_LON,
+        radius_km=BANDIRMA_RADIUS_KM,
+        now=now
+    )
+
+    # Türkiye genel küme (70 km) - turuncu/kırmızı eşikleri
+    tr = evaluate_turkiye_clusters(
+        db_rows=rows_30d,
+        radius_km=TR_CLUSTER_RADIUS_KM,
+        orange_mag=5.0,
+        orange_days=30,
+        red_mag=5.5,
+        red_days=14,
+        now=now
+    )
+
+    # 3) Tek mesaj Telegram
+    msg = build_message(tr, bd)
+    telegram_send(msg)
 
 if __name__ == "__main__":
     main()
