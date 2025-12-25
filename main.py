@@ -166,7 +166,7 @@ def build_message(tr: dict, bd: dict) -> str:
     msg = (
         f"🕒 UTC: {now}\n\n"
         f"📍 <b>Bandırma 70 km Alarm</b> ({bd_state})\n"
-        f"Merkez: {BANDIRMA_LAT:.4f},{BANDIRMA_LON:.4f} | Yarıçap: {bd['radius_km']} km\n"
+        f"Merkez: {BANDIRMA_latitude:.4f},{BANDIRMA_longitude:.4f} | Yarıçap: {bd['radius_km']} km\n"
     )
 
     c = bd["counts"]
