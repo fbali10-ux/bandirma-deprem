@@ -1,8 +1,11 @@
-name: veritabani senkronizasyonu
+name: db-sync
+
+permissions:
+  contents: write
 
 on:
   schedule:
-    - cron: "0 * * * *"   # Saatte 1
+    - cron: "0 * * * *"   # her saat başı
   workflow_dispatch:
 
 jobs:
@@ -10,21 +13,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: İşi kur
-        run: echo "Başladı"
-
-      - name: Depoyu klonla
+      - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Python kur
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
-      - name: Kütüphaneleri kur
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install -r requirements.txt
 
       - name: Telegram TEST (curl)
         env:
@@ -32,28 +34,31 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d chat_id="${TELEGRAM_CHAT_ID}" \
-          -d text="✅ GitHub Actions calisti (Deprem DB Sync)."
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=✅ GitHub Actions calisti (Deprem DB Sync)." >/dev/null
 
-      - name: Deprem scriptini calistir
+      - name: Run earthquake script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BANDIRMA_LAT: ${{ vars.BANDIRMA_LAT }}
+          BANDIRMA_LON: ${{ vars.BANDIRMA_LON }}
           HOURLY_STATUS: ${{ vars.HOURLY_STATUS }}
         run: |
           python main.py
 
-      - name: DB degisti mi? commit + push
+      - name: Commit & push DB if changed
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
-            git add .
-            git commit -m "DB auto update"
-            git push
-          else
-            echo "DB degismedi"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # DB dosya adın: deprem.db (senin klasörde bu var)
+          git add deprem.db || true
+
+          if git diff --cached --quiet; then
+            echo "DB degismemis, push yok."
+            exit 0
           fi
 
-      - name: Is bitti
-        run: echo "Tamamlandi"
+          git commit -m "deprem.db guncellendi [skip ci]"
+          git push
