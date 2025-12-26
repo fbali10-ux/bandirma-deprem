@@ -1,11 +1,8 @@
-name: db-sync
-
-permissions:
-  contents: write
+name: veritabani senkronizasyonu
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # Saatte 1
   workflow_dispatch:
 
 jobs:
@@ -13,18 +10,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Repo checkout
+      - name: İşi kur
+        run: echo "Başladı"
+
+      - name: Depoyu klonla
         uses: actions/checkout@v4
 
       - name: Python kur
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
 
-      - name: Kutuphaneleri kur
+      - name: Kütüphaneleri kur
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests beautifulsoup4
 
       - name: Telegram TEST (curl)
         env:
@@ -32,24 +32,28 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "text=✅ GitHub Actions calisti (Deprem DB Sync)."
+          -d chat_id="${TELEGRAM_CHAT_ID}" \
+          -d text="✅ GitHub Actions calisti (Deprem DB Sync)."
 
       - name: Deprem scriptini calistir
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HOURLY_STATUS: ${{ vars.HOURLY_STATUS }}
         run: |
           python main.py
 
-      - name: DB degisti mi? commit+push
+      - name: DB degisti mi? commit + push
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add deprem.db
-
-          if git diff --cached --quiet; then
-            echo "DB degismemis, push yok."
-            exit 0
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git add .
+            git commit -m "DB auto update"
+            git push
+          else
+            echo "DB degismedi"
           fi
 
-          git commit -m "deprem.db guncellendi [skip ci]"
-          git push
+      - name: Is bitti
+        run: echo "Tamamlandi"
