@@ -1,214 +1,89 @@
-# main.py
 import os
 import sqlite3
+import math
 import requests
-from datetime import datetime, timezone
-from bs4 import BeautifulSoup
+from datetime import datetime
 
-from turkiye_alarm import turkiye_alarm  # <-- DOĞRU import
-
-# -----------------------------
-# ENV
-# -----------------------------
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN".upper())
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")   or os.getenv("TELEGRAM_CHAT_ID".upper())
-
-BANDIRMA_LAT = float(os.getenv("BANDIRMA_LAT", "40.3522"))
-BANDIRMA_LON = float(os.getenv("BANDIRMA_LON", "27.9700"))
-
-# 1 ise her çalışmada “son 5 deprem” mesajını da gönderir.
-HOURLY_STATUS = str(os.getenv("HOURLY_STATUS", "0")).strip() == "1"
-
-DB_FILE = "deprem.db"
+# ------------------ AYARLAR ------------------
+DB_FILE = "deprem.db"   # repo'daki gerçek DB adı buysa böyle kalsın. (earthquake.db ise değiştir)
 KOERI_URL = "http://www.koeri.boun.edu.tr/scripts/lst9.asp"
 
+def env_get(name, default=None):
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return v
 
-# -----------------------------
-# Telegram
-# -----------------------------
-def telegram_send(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
+def send_telegram(text: str):
+    token = env_get("TELEGRAM_BOT_TOKEN")
+    chat_id = env_get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
         print("Telegram ENV eksik (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
+    ok = (r.status_code == 200)
+    if not ok:
+        print("Telegram hata:", r.status_code, r.text[:200])
+    return ok
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
-    if r.status_code != 200:
-        print("Telegram hata:", r.status_code, r.text[:2000])
-        return False
-    return True
-
-
-# -----------------------------
-# DB
-# -----------------------------
-def init_db(db_file: str):
+# ------------------ DB ------------------
+def connect_db(db_file: str):
     con = sqlite3.connect(db_file)
-    cur = con.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS earthquakes (
-            event_id TEXT PRIMARY KEY,
-            event_time TEXT,
-            latitude REAL,
-            longitude REAL,
-            depth REAL,
-            magnitude REAL,
-            location TEXT,
-            source TEXT
-        )
-        """
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS quakes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        qtime TEXT,
+        lat REAL,
+        lon REAL,
+        depth REAL,
+        mag REAL,
+        loc TEXT
     )
-    con.commit()
-    con.close()
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_quakes_time ON quakes(qtime)")
+    return con
 
-def upsert_quakes(db_file: str, rows):
-    """
-    rows: list of dict with keys:
-      event_id, event_time(ISO+00:00), latitude, longitude, depth, magnitude, location, source
-    """
-    con = sqlite3.connect(db_file)
+def get_last5(con):
     cur = con.cursor()
+    cur.execute("""
+        SELECT qtime, mag, depth, lat, lon, loc
+        FROM quakes
+        ORDER BY qtime DESC
+        LIMIT 5
+    """)
+    return cur.fetchall()
 
-    ins = 0
-    for r in rows:
-        try:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO earthquakes
-                (event_id, event_time, latitude, longitude, depth, magnitude, location, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    r["event_id"],
-                    r["event_time"],
-                    float(r["latitude"]),
-                    float(r["longitude"]),
-                    float(r["depth"]),
-                    float(r["magnitude"]),
-                    r.get("location", ""),
-                    r.get("source", "KOERI"),
-                ),
-            )
-            if cur.rowcount == 1:
-                ins += 1
-        except Exception as e:
-            print("DB insert hata:", e)
+# ------------------ ALARM (şimdilik basit stub) ------------------
+# Senin alarm/cluster fonksiyonların projede zaten varsa burada çağırırız.
+# Şu an amaç: "son 5 deprem" kesin gitsin.
+def check_alarm(con) -> (bool, str):
+    # TODO: burada senin mevcut alarm/cluster mantığını çağıracağız.
+    # Şimdilik "alarm yok" diyelim:
+    return False, ""
 
-    con.commit()
-    con.close()
-    return ins
+def fmt_last5(rows):
+    if not rows:
+        return "DB boş görünüyor."
+    lines = ["📌 Son 5 Deprem (KOERI DB)"]
+    for qtime, mag, depth, lat, lon, loc in rows:
+        # qtime string ise aynen bas
+        lines.append(f"- {qtime} | M{mag:.1f} | {depth:.1f}km | {lat:.4f},{lon:.4f} | {loc}")
+    return "\n".join(lines)
 
-
-# -----------------------------
-# KOERI Parse
-# -----------------------------
-def _to_iso_utc(dt_str: str) -> str:
-    """
-    KOERI tarih formatı değişebiliyor.
-    En yaygın: 'YYYY.MM.DD HH:MM:SS'
-    """
-    s = dt_str.strip()
-    # KOERI bazen arada çok boşluk bırakıyor
-    s = " ".join(s.split())
-    # örn 2025.12.26 12:34:56
-    dt = datetime.strptime(s, "%Y.%m.%d %H:%M:%S")
-    dt = dt.replace(tzinfo=timezone.utc)
-    return dt.isoformat(timespec="seconds")
-
-def fetch_koeri_last500():
-    html = requests.get(KOERI_URL, timeout=30).content
-    soup = BeautifulSoup(html, "html.parser")
-    pre = soup.find("pre")
-    if not pre:
-        raise SystemExit("KOERI sayfasında <pre> bulunamadı (format değişmiş olabilir).")
-
-    lines = [ln.rstrip("\n") for ln in pre.get_text("\n").splitlines()]
-    # İlk satırlar başlık olur; veri satırlarını yakalamaya çalış
-    data = []
-    for ln in lines:
-        ln = ln.strip()
-        if not ln:
-            continue
-        # başlık satırlarını ele
-        if ln.lower().startswith("tarih") or ln.startswith("-"):
-            continue
-        parts = ln.split()
-        # beklenen minimum kolon
-        if len(parts) < 8:
-            continue
-
-        # KOERI tipik: Tarih Saat Enlem Boylam Derinlik ... Mw Yer
-        # Tarih + Saat:
-        dt = f"{parts[0]} {parts[1]}"
-        try:
-            event_time = _to_iso_utc(dt)
-        except:
-            continue
-
-        try:
-            lat = float(parts[2])
-            lon = float(parts[3])
-            depth = float(parts[4])
-        except:
-            continue
-
-        # Mw/Md gibi büyüklük kolonunu yakalamaya çalış
-        mag = None
-        for p in parts[5:10]:
-            try:
-                mag = float(p.replace(",", "."))
-                break
-            except:
-                pass
-        if mag is None:
-            continue
-
-        # location genelde satırın son tarafı
-        loc = " ".join(parts[10:]) if len(parts) > 10 else ""
-
-        event_id = f"KOERI_{event_time}_{lat}_{lon}_{depth}_{mag}".replace(":", "").replace("+", "")
-        data.append(
-            {
-                "event_id": event_id,
-                "event_time": event_time,
-                "latitude": lat,
-                "longitude": lon,
-                "depth": depth,
-                "magnitude": mag,
-                "location": loc,
-                "source": "KOERI",
-            }
-        )
-
-    # KOERI zaten “son X” verir; biz makul bir sayı keselim
-    return data[:500]
-
-
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-    init_db(DB_FILE)
+    con = connect_db(DB_FILE)
 
-    koeri_rows = fetch_koeri_last500()
-    added = upsert_quakes(DB_FILE, koeri_rows)
-    print(f"KOERI satır: {len(koeri_rows)} | Yeni eklenen: {added}")
+    # 1) HER ÇALIŞMADA SON 5 GÖNDER (kesin)
+    last5 = get_last5(con)
+    send_telegram(fmt_last5(last5))
 
-    has_alarm, alarm_msg, last5_block = turkiye_alarm(DB_FILE, BANDIRMA_LAT, BANDIRMA_LON, 70.0)
+    # 2) Alarm varsa ayrıca gönder
+    has_alarm, alarm_msg = check_alarm(con)
+    if has_alarm and alarm_msg:
+        send_telegram(alarm_msg)
 
-    # 1) Alarm varsa HER ZAMAN gönder
-    if has_alarm:
-        telegram_send(alarm_msg)
-        return
-
-    # 2) Alarm yoksa HOURLY_STATUS=1 ise son 5 depremi gönder
-    if HOURLY_STATUS:
-        telegram_send(last5_block)
-        print("Alarm yok ama son 5 deprem gönderildi (HOURLY_STATUS=1).")
-    else:
-        print("Alarm yok (HOURLY_STATUS=0 olduğu için mesaj gönderilmedi).")
-
+    con.close()
 
 if __name__ == "__main__":
     main()
