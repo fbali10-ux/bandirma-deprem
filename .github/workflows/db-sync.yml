@@ -1,32 +1,31 @@
 name: db-sync
 
-on:
-  schedule:
-    - cron: "0 * * * *"   # her saat başı
-  workflow_dispatch:
-
 permissions:
   contents: write
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # Her saat başı
+  workflow_dispatch:
 
 jobs:
   db-sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Depo kontrolü
+      - name: Depoyu inceleyin
         uses: actions/checkout@v4
 
-      - name: Python kur
+      - name: Python kurulumu
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Kutuphaneleri kur
+      - name: Bağımlılıkları yükleyin
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # İstersen dursun: sadece "workflow çalıştı" diye test mesajı
       - name: Telegram TEST (curl)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -34,30 +33,26 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "text=✅ GitHub Actions calisti (db-sync)."
+            -d "text=✅ GitHub Actions çalıştı (Deprem senaryosu başlıyor)."
 
-      - name: Deprem scriptini calistir
+      - name: Deprem senaryosunu çalıştır
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BANDIRMA_LAT: ${{ vars.BANDIRMA_LAT }}
           BANDIRMA_LON: ${{ vars.BANDIRMA_LON }}
-          BANDIRMA_RADIUS_KM: "100"
-          DB_FILE: "deprem.db"
+          HOURLY_STATUS: ${{ vars.HOURLY_STATUS }}
         run: |
           python main.py
 
-      - name: DB degisti mi? commit+push
+      - name: Değişiklik varsa veritabanını kaydet ve gönder
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add deprem.db
-
           if git diff --cached --quiet; then
-            echo "DB degismemis, push yok."
+            echo "DB değişmemiş."
             exit 0
           fi
-
-          git commit -m "deprem.db guncellendi [skip ci]"
+          git commit -m "deprem.db güncellendi [skip ci]"
           git push
