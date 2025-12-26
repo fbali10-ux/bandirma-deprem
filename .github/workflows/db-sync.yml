@@ -1,33 +1,32 @@
 name: db-sync
 
-permissions:
-  contents: write
-
 on:
   schedule:
     - cron: "0 * * * *"   # her saat başı
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   db-sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Depo kontrolü
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python
+      - name: Python kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Kutuphaneleri kur
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # İstersen dursun: sadece "workflow çalıştı" diye test mesajı
       - name: Telegram TEST (curl)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -35,25 +34,25 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "text=✅ GitHub Actions calisti (Deprem DB Sync)." >/dev/null
+            -d "text=✅ GitHub Actions calisti (db-sync)."
 
-      - name: Run earthquake script
+      - name: Deprem scriptini calistir
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BANDIRMA_LAT: ${{ vars.BANDIRMA_LAT }}
           BANDIRMA_LON: ${{ vars.BANDIRMA_LON }}
-          HOURLY_STATUS: ${{ vars.HOURLY_STATUS }}
+          BANDIRMA_RADIUS_KM: "100"
+          DB_FILE: "deprem.db"
         run: |
           python main.py
 
-      - name: Commit & push DB if changed
+      - name: DB degisti mi? commit+push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # DB dosya adın: deprem.db (senin klasörde bu var)
-          git add deprem.db || true
+          git add deprem.db
 
           if git diff --cached --quiet; then
             echo "DB degismemis, push yok."
