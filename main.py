@@ -51,17 +51,65 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 def ensure_db(conn):
+    """
+    ✅ DB migration-safe:
+    - tablo yoksa oluşturur
+    - tablo varsa eksik kolonları ALTER TABLE ile ekler
+    - sonra unique index'i güvenle oluşturur
+    """
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS earthquakes (
-            event_time TEXT,
-            latitude REAL,
-            longitude REAL,
-            magnitude REAL,
-            depth_km REAL,
-            location TEXT
-        )
-    """)
+
+    # Tablo var mı?
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='earthquakes'")
+    exists = cur.fetchone() is not None
+
+    if not exists:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS earthquakes (
+                event_time TEXT,
+                latitude REAL,
+                longitude REAL,
+                magnitude REAL,
+                depth_km REAL,
+                location TEXT
+            )
+        """)
+        conn.commit()
+    else:
+        # Mevcut kolonlar
+        cur.execute("PRAGMA table_info(earthquakes)")
+        cols = {row[1] for row in cur.fetchall()}  # row[1] = name
+
+        # Eksik kolonları ekle (eski db'lerde depth_km olmayabiliyor)
+        needed = {
+            "event_time": "TEXT",
+            "latitude": "REAL",
+            "longitude": "REAL",
+            "magnitude": "REAL",
+            "depth_km": "REAL",
+            "location": "TEXT",
+        }
+
+        for c, typ in needed.items():
+            if c not in cols:
+                cur.execute(f"ALTER TABLE earthquakes ADD COLUMN {c} {typ}")
+        conn.commit()
+
+        # Eğer eski db’de "depth" diye bir kolon varsa ve depth_km boşsa, kopyalamayı dene
+        try:
+            cur.execute("PRAGMA table_info(earthquakes)")
+            cols2 = {row[1] for row in cur.fetchall()}
+            if "depth" in cols2 and "depth_km" in cols2:
+                cur.execute("""
+                    UPDATE earthquakes
+                    SET depth_km = depth
+                    WHERE depth_km IS NULL
+                """)
+                conn.commit()
+        except Exception:
+            pass
+
+    # Unique index (depth_km artık garanti var)
     cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_eq
         ON earthquakes(event_time, latitude, longitude, magnitude, depth_km, location)
@@ -132,7 +180,12 @@ def upsert(conn, rows):
     cur = conn.cursor()
     added = 0
     for r in rows:
-        cur.execute("INSERT OR IGNORE INTO earthquakes VALUES (?, ?, ?, ?, ?, ?)", r)
+        # ✅ Kolon isimleriyle insert (schema farklılıklarında daha güvenli)
+        cur.execute("""
+            INSERT OR IGNORE INTO earthquakes
+            (event_time, latitude, longitude, magnitude, depth_km, location)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, r)
         if cur.rowcount == 1:
             added += 1
     conn.commit()
@@ -150,7 +203,7 @@ def last_n_near(conn, lat0, lon0, radius, n):
     for et, lat, lon, depth, mag, loc in cur.fetchall():
         dist = haversine_km(lat0, lon0, lat, lon)
         if dist <= radius:
-            out.append((et, depth, mag, loc, dist))
+            out.append((et, depth if depth is not None else 0.0, mag, loc, dist))
         if len(out) >= n:
             break
     return out
@@ -243,8 +296,6 @@ def main():
     msg.extend(fmt_events(konak) if konak else ["• Kayıt yok"])
 
     # Telegram gönderim kuralı:
-    # - FORCE_TELEGRAM=1 ise her zaman
-    # - yoksa sadece (added>0) veya herhangi bir alarm ORANGE/RED ise
     send = (
         FORCE_TELEGRAM
         or added > 0
