@@ -41,7 +41,6 @@ KONAK_LON = float(os.getenv("KONAK_LON", "27.1287"))
 KONAK_RADIUS_KM = float(os.getenv("KONAK_RADIUS_KM", "100"))
 KONAK_LIST_N = 2
 
-
 # ===================== YARDIMCILAR =====================
 def haversine_km(lat1, lon1, lat2, lon2):
     r = 6371.0
@@ -51,27 +50,24 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
 
-
-def _column_exists(conn, table, col):
+def column_exists(conn, table, col):
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
     return col in cols
 
-
-def _dedupe_before_unique_index(conn):
+def dedupe_eq(conn):
     """
-    UNIQUE index oluşmadan önce duplicate kayıtları temizler.
-    Aynı (event_time,lat,lon,mag,depth_km,location) kombinasyonundan en eski rowid kalır.
+    Unique index hatasını engellemek için duplicate kayıtları temizler.
+    Aynı (event_time,lat,lon,mag,depth_km,location) varsa 1 tanesini bırakır.
     """
     cur = conn.cursor()
-    # tablo yoksa dön
+    # tablo var mı?
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='earthquakes'")
     if not cur.fetchone():
         return
 
-    # depth_km yoksa bu dedupe query çalışmaz; önce migrate/kolon eklenmeli
-    if not _column_exists(conn, "earthquakes", "depth_km"):
+    if not column_exists(conn, "earthquakes", "depth_km"):
         return
 
     cur.execute("""
@@ -84,11 +80,9 @@ def _dedupe_before_unique_index(conn):
     """)
     conn.commit()
 
-
 def ensure_db(conn):
     cur = conn.cursor()
 
-    # tablo oluştur
     cur.execute("""
         CREATE TABLE IF NOT EXISTS earthquakes (
             event_time TEXT,
@@ -101,30 +95,54 @@ def ensure_db(conn):
     """)
     conn.commit()
 
-    # Eğer eski şemadan gelen DB varsa ve depth_km kolonu yoksa ekle
-    if not _column_exists(conn, "earthquakes", "depth_km"):
+    # Eski şema DB gelmişse depth_km ekle
+    if not column_exists(conn, "earthquakes", "depth_km"):
         try:
             cur.execute("ALTER TABLE earthquakes ADD COLUMN depth_km REAL")
             conn.commit()
         except Exception:
             pass
 
-    # index yaratmadan önce dedupe (Actions'taki UNIQUE constraint patlamasını çözer)
-    _dedupe_before_unique_index(conn)
+    # 1) önce dedupe dene
+    dedupe_eq(conn)
 
-    # Unique index'i güvenli şekilde oluştur
-    # Eğer yine IntegrityError olursa bir kez daha dedupe edip tekrar deneriz.
-    for _ in range(2):
+    # 2) UNIQUE index oluşturmayı dene. Patlarsa: tekrar dedupe, yine patlarsa tabloyu sıfırla.
+    for attempt in range(3):
         try:
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_eq
                 ON earthquakes(event_time, latitude, longitude, magnitude, depth_km, location)
             """)
             conn.commit()
-            break
+            return
         except sqlite3.IntegrityError:
-            _dedupe_before_unique_index(conn)
+            # duplicate var: temizle
+            dedupe_eq(conn)
+        except Exception:
+            # beklenmedik bir şeyse yine dedupe dene
+            dedupe_eq(conn)
 
+    # 3) Hâlâ olmadıysa (Actions'ta bozuk DB olabiliyor) tabloyu resetle
+    print("DB UNIQUE index kurulamadı; DB sıfırlanıyor (Actions fix).")
+    cur.execute("DROP TABLE IF EXISTS earthquakes")
+    cur.execute("DROP INDEX IF EXISTS uq_eq")
+    conn.commit()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS earthquakes (
+            event_time TEXT,
+            latitude REAL,
+            longitude REAL,
+            magnitude REAL,
+            depth_km REAL,
+            location TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_eq
+        ON earthquakes(event_time, latitude, longitude, magnitude, depth_km, location)
+    """)
+    conn.commit()
 
 def trim_db(conn):
     cur = conn.cursor()
@@ -141,7 +159,6 @@ def trim_db(conn):
         )
     """, (n - MAX_ROWS,))
     conn.commit()
-
 
 def parse_koeri():
     html = requests.get(KOERI_URL, timeout=30).content
@@ -187,7 +204,6 @@ def parse_koeri():
 
     return rows
 
-
 def upsert(conn, rows):
     cur = conn.cursor()
     added = 0
@@ -197,7 +213,6 @@ def upsert(conn, rows):
             added += 1
     conn.commit()
     return added
-
 
 def last_n_near(conn, lat0, lon0, radius, n):
     cur = conn.cursor()
@@ -216,14 +231,12 @@ def last_n_near(conn, lat0, lon0, radius, n):
             break
     return out
 
-
 def compute_alarm_label(max_mag, orange_thr, red_thr):
     if max_mag >= red_thr:
         return "🟥 *RED*"
     if max_mag >= orange_thr:
         return "🟧 *ORANGE*"
     return "🟩 *NORMAL*"
-
 
 def fmt_events(events):
     lines = []
@@ -235,7 +248,6 @@ def fmt_events(events):
         lines.append(f"• *{mag:.1f}* | {t} | {depth:.1f} km | {dist:.0f} km")
         lines.append(f"  {loc}")
     return lines
-
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -256,7 +268,6 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram gönderim exception:", e)
         return False
-
 
 # ===================== MAIN =====================
 def main():
@@ -307,7 +318,6 @@ def main():
     msg.append(f"🟪 *İzmir Konak* Alarm: {konak_alarm}")
     msg.extend(fmt_events(konak) if konak else ["• Kayıt yok"])
 
-    # Telegram gönderim kuralı:
     send = (
         FORCE_TELEGRAM
         or added > 0
@@ -321,7 +331,6 @@ def main():
         send_telegram("\n".join(msg))
 
     conn.close()
-
 
 if __name__ == "__main__":
     main()
