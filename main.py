@@ -29,17 +29,17 @@ TR_WINDOW_N = int(os.getenv("TR_WINDOW_N", "500"))
 BANDIRMA_LAT = float(os.getenv("BANDIRMA_LAT", "40.3522"))
 BANDIRMA_LON = float(os.getenv("BANDIRMA_LON", "27.9767"))
 BANDIRMA_RADIUS_KM = float(os.getenv("BANDIRMA_RADIUS_KM", "100"))
-BANDIRMA_LIST_N = 2
+BANDIRMA_LIST_N = int(os.getenv("BANDIRMA_LIST_N", "2"))
 
 BURSA_LAT = float(os.getenv("BURSA_LAT", "40.1950"))
 BURSA_LON = float(os.getenv("BURSA_LON", "29.0600"))
 BURSA_RADIUS_KM = float(os.getenv("BURSA_RADIUS_KM", "100"))
-BURSA_LIST_N = 2
+BURSA_LIST_N = int(os.getenv("BURSA_LIST_N", "2"))
 
 KONAK_LAT = float(os.getenv("KONAK_LAT", "38.4192"))
 KONAK_LON = float(os.getenv("KONAK_LON", "27.1287"))
 KONAK_RADIUS_KM = float(os.getenv("KONAK_RADIUS_KM", "100"))
-KONAK_LIST_N = 2
+KONAK_LIST_N = int(os.getenv("KONAK_LIST_N", "2"))
 
 # ===================== YARDIMCILAR =====================
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -50,66 +50,46 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
 
+def _table_cols(cur, table_name: str):
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return [r[1] for r in cur.fetchall()]  # name
+
 def ensure_db(conn):
     """
-    ✅ DB migration-safe:
-    - tablo yoksa oluşturur
-    - tablo varsa eksik kolonları ALTER TABLE ile ekler
-    - sonra unique index'i güvenle oluşturur
+    Hem yeni DB'yi kurar, hem de eski deprem.db şemalarını otomatik migrate eder.
+    Actions'ta 'no such column: depth_km' hatasının kalıcı çözümü burası.
     """
     cur = conn.cursor()
 
-    # Tablo var mı?
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='earthquakes'")
-    exists = cur.fetchone() is not None
+    # 1) Tablo yoksa yeni şemayla oluştur
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS earthquakes (
+            event_time TEXT,
+            latitude REAL,
+            longitude REAL,
+            magnitude REAL,
+            depth_km REAL,
+            location TEXT
+        )
+    """)
+    conn.commit()
 
-    if not exists:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS earthquakes (
-                event_time TEXT,
-                latitude REAL,
-                longitude REAL,
-                magnitude REAL,
-                depth_km REAL,
-                location TEXT
-            )
-        """)
+    # 2) Eski DB ise kolonları migrate et
+    cols = _table_cols(cur, "earthquakes")
+
+    # depth_km yoksa ekle
+    if "depth_km" not in cols:
+        cur.execute("ALTER TABLE earthquakes ADD COLUMN depth_km REAL")
         conn.commit()
-    else:
-        # Mevcut kolonlar
-        cur.execute("PRAGMA table_info(earthquakes)")
-        cols = {row[1] for row in cur.fetchall()}  # row[1] = name
+        cols = _table_cols(cur, "earthquakes")
 
-        # Eksik kolonları ekle (eski db'lerde depth_km olmayabiliyor)
-        needed = {
-            "event_time": "TEXT",
-            "latitude": "REAL",
-            "longitude": "REAL",
-            "magnitude": "REAL",
-            "depth_km": "REAL",
-            "location": "TEXT",
-        }
-
-        for c, typ in needed.items():
-            if c not in cols:
-                cur.execute(f"ALTER TABLE earthquakes ADD COLUMN {c} {typ}")
+    # Bazı eski şemalarda depth diye kolon olabilir -> depth_km'ye kopyala
+    if "depth" in cols:
+        cur.execute("UPDATE earthquakes SET depth_km = COALESCE(depth_km, depth)")
         conn.commit()
 
-        # Eğer eski db’de "depth" diye bir kolon varsa ve depth_km boşsa, kopyalamayı dene
-        try:
-            cur.execute("PRAGMA table_info(earthquakes)")
-            cols2 = {row[1] for row in cur.fetchall()}
-            if "depth" in cols2 and "depth_km" in cols2:
-                cur.execute("""
-                    UPDATE earthquakes
-                    SET depth_km = depth
-                    WHERE depth_km IS NULL
-                """)
-                conn.commit()
-        except Exception:
-            pass
-
-    # Unique index (depth_km artık garanti var)
+    # 3) UNIQUE index’i en sona bırak (kolon hazır olmadan yapılınca patlıyordu)
+    cur.execute("DROP INDEX IF EXISTS uq_eq")
     cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_eq
         ON earthquakes(event_time, latitude, longitude, magnitude, depth_km, location)
@@ -180,12 +160,7 @@ def upsert(conn, rows):
     cur = conn.cursor()
     added = 0
     for r in rows:
-        # ✅ Kolon isimleriyle insert (schema farklılıklarında daha güvenli)
-        cur.execute("""
-            INSERT OR IGNORE INTO earthquakes
-            (event_time, latitude, longitude, magnitude, depth_km, location)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, r)
+        cur.execute("INSERT OR IGNORE INTO earthquakes VALUES (?, ?, ?, ?, ?, ?)", r)
         if cur.rowcount == 1:
             added += 1
     conn.commit()
@@ -197,7 +172,7 @@ def last_n_near(conn, lat0, lon0, radius, n):
         SELECT event_time, latitude, longitude, depth_km, magnitude, location
         FROM earthquakes
         ORDER BY event_time DESC
-        LIMIT 800
+        LIMIT 1200
     """)
     out = []
     for et, lat, lon, depth, mag, loc in cur.fetchall():
