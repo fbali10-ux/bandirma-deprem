@@ -7,3 +7,7 @@ deprem_backup_*.db
 tg_test.py
 venv/
 __pycache__/
+deprem.db
+deprem_local.db
+*_backup_*.db
+*.db
