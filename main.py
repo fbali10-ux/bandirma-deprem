@@ -20,7 +20,7 @@ FORCE_TELEGRAM = os.getenv("FORCE_TELEGRAM", "0") == "1"
 ORANGE_MW = float(os.getenv("ORANGE_MW", "5.0"))
 RED_MW = float(os.getenv("RED_MW", "6.0"))
 
-# Türkiye geneli eşikler (istersen ayrı)
+# Türkiye geneli eşikler
 TR_ORANGE_MW = float(os.getenv("TR_ORANGE_MW", str(ORANGE_MW)))
 TR_RED_MW = float(os.getenv("TR_RED_MW", str(RED_MW)))
 TR_WINDOW_N = int(os.getenv("TR_WINDOW_N", "500"))
@@ -29,17 +29,18 @@ TR_WINDOW_N = int(os.getenv("TR_WINDOW_N", "500"))
 BANDIRMA_LAT = float(os.getenv("BANDIRMA_LAT", "40.3522"))
 BANDIRMA_LON = float(os.getenv("BANDIRMA_LON", "27.9767"))
 BANDIRMA_RADIUS_KM = float(os.getenv("BANDIRMA_RADIUS_KM", "100"))
-BANDIRMA_LIST_N = int(os.getenv("BANDIRMA_LIST_N", "2"))
+BANDIRMA_LIST_N = 2
 
 BURSA_LAT = float(os.getenv("BURSA_LAT", "40.1950"))
 BURSA_LON = float(os.getenv("BURSA_LON", "29.0600"))
 BURSA_RADIUS_KM = float(os.getenv("BURSA_RADIUS_KM", "100"))
-BURSA_LIST_N = int(os.getenv("BURSA_LIST_N", "2"))
+BURSA_LIST_N = 2
 
 KONAK_LAT = float(os.getenv("KONAK_LAT", "38.4192"))
 KONAK_LON = float(os.getenv("KONAK_LON", "27.1287"))
 KONAK_RADIUS_KM = float(os.getenv("KONAK_RADIUS_KM", "100"))
-KONAK_LIST_N = int(os.getenv("KONAK_LIST_N", "2"))
+KONAK_LIST_N = 2
+
 
 # ===================== YARDIMCILAR =====================
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -50,18 +51,44 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
 
-def _table_cols(cur, table_name: str):
-    cur.execute(f"PRAGMA table_info({table_name})")
-    return [r[1] for r in cur.fetchall()]  # name
 
-def ensure_db(conn):
+def _column_exists(conn, table, col):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return col in cols
+
+
+def _dedupe_before_unique_index(conn):
     """
-    Hem yeni DB'yi kurar, hem de eski deprem.db şemalarını otomatik migrate eder.
-    Actions'ta 'no such column: depth_km' hatasının kalıcı çözümü burası.
+    UNIQUE index oluşmadan önce duplicate kayıtları temizler.
+    Aynı (event_time,lat,lon,mag,depth_km,location) kombinasyonundan en eski rowid kalır.
     """
     cur = conn.cursor()
+    # tablo yoksa dön
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='earthquakes'")
+    if not cur.fetchone():
+        return
 
-    # 1) Tablo yoksa yeni şemayla oluştur
+    # depth_km yoksa bu dedupe query çalışmaz; önce migrate/kolon eklenmeli
+    if not _column_exists(conn, "earthquakes", "depth_km"):
+        return
+
+    cur.execute("""
+        DELETE FROM earthquakes
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM earthquakes
+            GROUP BY event_time, latitude, longitude, magnitude, depth_km, location
+        )
+    """)
+    conn.commit()
+
+
+def ensure_db(conn):
+    cur = conn.cursor()
+
+    # tablo oluştur
     cur.execute("""
         CREATE TABLE IF NOT EXISTS earthquakes (
             event_time TEXT,
@@ -74,27 +101,30 @@ def ensure_db(conn):
     """)
     conn.commit()
 
-    # 2) Eski DB ise kolonları migrate et
-    cols = _table_cols(cur, "earthquakes")
+    # Eğer eski şemadan gelen DB varsa ve depth_km kolonu yoksa ekle
+    if not _column_exists(conn, "earthquakes", "depth_km"):
+        try:
+            cur.execute("ALTER TABLE earthquakes ADD COLUMN depth_km REAL")
+            conn.commit()
+        except Exception:
+            pass
 
-    # depth_km yoksa ekle
-    if "depth_km" not in cols:
-        cur.execute("ALTER TABLE earthquakes ADD COLUMN depth_km REAL")
-        conn.commit()
-        cols = _table_cols(cur, "earthquakes")
+    # index yaratmadan önce dedupe (Actions'taki UNIQUE constraint patlamasını çözer)
+    _dedupe_before_unique_index(conn)
 
-    # Bazı eski şemalarda depth diye kolon olabilir -> depth_km'ye kopyala
-    if "depth" in cols:
-        cur.execute("UPDATE earthquakes SET depth_km = COALESCE(depth_km, depth)")
-        conn.commit()
+    # Unique index'i güvenli şekilde oluştur
+    # Eğer yine IntegrityError olursa bir kez daha dedupe edip tekrar deneriz.
+    for _ in range(2):
+        try:
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_eq
+                ON earthquakes(event_time, latitude, longitude, magnitude, depth_km, location)
+            """)
+            conn.commit()
+            break
+        except sqlite3.IntegrityError:
+            _dedupe_before_unique_index(conn)
 
-    # 3) UNIQUE index’i en sona bırak (kolon hazır olmadan yapılınca patlıyordu)
-    cur.execute("DROP INDEX IF EXISTS uq_eq")
-    cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_eq
-        ON earthquakes(event_time, latitude, longitude, magnitude, depth_km, location)
-    """)
-    conn.commit()
 
 def trim_db(conn):
     cur = conn.cursor()
@@ -111,6 +141,7 @@ def trim_db(conn):
         )
     """, (n - MAX_ROWS,))
     conn.commit()
+
 
 def parse_koeri():
     html = requests.get(KOERI_URL, timeout=30).content
@@ -156,6 +187,7 @@ def parse_koeri():
 
     return rows
 
+
 def upsert(conn, rows):
     cur = conn.cursor()
     added = 0
@@ -166,13 +198,14 @@ def upsert(conn, rows):
     conn.commit()
     return added
 
+
 def last_n_near(conn, lat0, lon0, radius, n):
     cur = conn.cursor()
     cur.execute("""
         SELECT event_time, latitude, longitude, depth_km, magnitude, location
         FROM earthquakes
         ORDER BY event_time DESC
-        LIMIT 1200
+        LIMIT 800
     """)
     out = []
     for et, lat, lon, depth, mag, loc in cur.fetchall():
@@ -183,12 +216,14 @@ def last_n_near(conn, lat0, lon0, radius, n):
             break
     return out
 
+
 def compute_alarm_label(max_mag, orange_thr, red_thr):
     if max_mag >= red_thr:
         return "🟥 *RED*"
     if max_mag >= orange_thr:
         return "🟧 *ORANGE*"
     return "🟩 *NORMAL*"
+
 
 def fmt_events(events):
     lines = []
@@ -200,6 +235,7 @@ def fmt_events(events):
         lines.append(f"• *{mag:.1f}* | {t} | {depth:.1f} km | {dist:.0f} km")
         lines.append(f"  {loc}")
     return lines
+
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -220,6 +256,7 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram gönderim exception:", e)
         return False
+
 
 # ===================== MAIN =====================
 def main():
@@ -284,6 +321,7 @@ def main():
         send_telegram("\n".join(msg))
 
     conn.close()
+
 
 if __name__ == "__main__":
     main()
