@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 son_depremler.py
+deprem.db
+*.db
+deprem_backup_*.db
+tg_test.py
+venv/
+__pycache__/
